@@ -147,6 +147,295 @@ class TestImageTransform:
         assert_image_equal(blank, transformed.crop((w // 2, 0, w, h // 2)))
         assert_image_equal(blank, transformed.crop((0, h // 2, w // 2, h)))
 
+    @pytest.mark.parametrize(
+        "resample",
+        (
+            Image.Resampling.NEAREST,
+            Image.Resampling.BILINEAR,
+            Image.Resampling.BICUBIC,
+        ),
+    )
+    def test_mesh_adjacent_grid(self, resample: Image.Resampling) -> None:
+        # The destination boxes tile the canvas.  Their identity quads use
+        # the documented NW, SW, SE, NE order and the corner coordinate
+        # convention, so every output pixel samples the same source pixel.
+        size = (9, 7)
+        source = Image.new("RGB", size)
+        source.putdata(
+            [
+                ((17 * x) % 256, (29 * y) % 256, (11 * (x + y)) % 256)
+                for y in range(size[1])
+                for x in range(size[0])
+            ]
+        )
+
+        xs = (0, 4, size[0])
+        ys = (0, 3, size[1])
+        mesh = [
+            (
+                (x0, y0, x1, y1),
+                (x0, y0, x0, y1, x1, y1, x1, y0),
+            )
+            for y0, y1 in zip(ys, ys[1:])
+            for x0, x1 in zip(xs, xs[1:])
+        ]
+
+        transformed = source.transform(size, Image.Transform.MESH, mesh, resample)
+        assert transformed.size == size
+        assert_image_equal(transformed, source)
+
+        # Pixels on both sides of each shared edge retain their own source
+        # coordinates instead of being shifted or exchanged by the split.
+        for y in range(size[1]):
+            assert transformed.getpixel((3, y)) == source.getpixel((3, y))
+            assert transformed.getpixel((4, y)) == source.getpixel((4, y))
+        for x in range(size[0]):
+            assert transformed.getpixel((x, 2)) == source.getpixel((x, 2))
+            assert transformed.getpixel((x, 3)) == source.getpixel((x, 3))
+
+        reordered = source.transform(size, Image.Transform.MESH, mesh[::-1], resample)
+        assert reordered.size == size
+        assert_image_equal(reordered, source)
+
+        via_transform = source.transform(
+            size, ImageTransform.MeshTransform(mesh), resample=resample
+        )
+        assert_image_equal(via_transform, source)
+
+    @pytest.mark.parametrize(
+        "resample",
+        (
+            Image.Resampling.NEAREST,
+            Image.Resampling.BILINEAR,
+            Image.Resampling.BICUBIC,
+        ),
+    )
+    def test_mesh_quad_samples_into_destination_box(
+        self, resample: Image.Resampling
+    ) -> None:
+        source = Image.new("L", (4, 2))
+        source.putdata([10, 20, 30, 40, 50, 60, 70, 80])
+
+        # The box is the rectangle to write in output coordinates; the quad
+        # is the four source positions to sample, in NW, SW, SE, NE order.
+        transformed = source.transform(
+            (4, 2),
+            Image.Transform.MESH,
+            [((2, 0, 4, 2), (0, 0, 0, 2, 2, 2, 2, 0))],
+            resample,
+        )
+
+        expected = Image.new("L", (4, 2))
+        expected.putdata([0, 0, 10, 20, 0, 0, 50, 60])
+        assert_image_equal(transformed, expected)
+
+    @pytest.mark.parametrize(
+        "matrix",
+        (
+            (2, 0, 0, 0, 2, 0),
+            (1, 1, 0, 0, 1, 0),
+        ),
+    )
+    @pytest.mark.parametrize(
+        "resample",
+        (
+            Image.Resampling.NEAREST,
+            Image.Resampling.BILINEAR,
+            Image.Resampling.BICUBIC,
+        ),
+    )
+    def test_mesh_grid_source_positions(
+        self,
+        matrix: tuple[int, int, int, int, int, int],
+        resample: Image.Resampling,
+    ) -> None:
+        size = (8, 6)
+        source = Image.new("RGB", (16, 12))
+        source.putdata(
+            [
+                ((17 * x) % 256, (29 * y) % 256, (11 * (x + y)) % 256)
+                for y in range(source.height)
+                for x in range(source.width)
+            ]
+        )
+
+        a, b, c, d, e, f = matrix
+
+        def map_corner(x: int, y: int) -> tuple[int, int]:
+            return a * x + b * y + c, d * x + e * y + f
+
+        xs = (0, 3, size[0])
+        ys = (0, 2, size[1])
+        mesh = []
+        for y0, y1 in zip(ys, ys[1:]):
+            for x0, x1 in zip(xs, xs[1:]):
+                nw = map_corner(x0, y0)
+                sw = map_corner(x0, y1)
+                se = map_corner(x1, y1)
+                ne = map_corner(x1, y0)
+                mesh.append(
+                    (
+                        (x0, y0, x1, y1),
+                        (*nw, *sw, *se, *ne),
+                    )
+                )
+
+        transformed = source.transform(size, Image.Transform.MESH, mesh, resample)
+        expected = source.transform(size, Image.Transform.AFFINE, matrix, resample)
+        assert transformed.size == size
+        assert_image_equal(transformed, expected)
+
+        reordered = source.transform(
+            size, Image.Transform.MESH, [mesh[3], mesh[0], mesh[2], mesh[1]], resample
+        )
+        assert_image_equal(reordered, expected)
+
+        if resample == Image.Resampling.NEAREST and matrix == (2, 0, 0, 0, 2, 0):
+            for y in range(size[1]):
+                for x in range(size[0]):
+                    assert transformed.getpixel((x, y)) == source.getpixel(
+                        (2 * x + 1, 2 * y + 1)
+                    )
+
+    @pytest.mark.parametrize("mode", ("RGB", "RGBA", "LA"))
+    @pytest.mark.parametrize("fillcolor", (None, "red"))
+    @pytest.mark.parametrize(
+        "resample",
+        (
+            Image.Resampling.NEAREST,
+            Image.Resampling.BILINEAR,
+            Image.Resampling.BICUBIC,
+        ),
+    )
+    def test_mesh_uncovered_grid_area(
+        self,
+        mode: str,
+        fillcolor: str | None,
+        resample: Image.Resampling,
+    ) -> None:
+        size = (8, 6)
+        rgb = Image.new("RGB", size)
+        rgb.putdata(
+            [
+                ((31 * x) % 256, (43 * y) % 256, (17 * (x + y)) % 256)
+                for y in range(size[1])
+                for x in range(size[0])
+            ]
+        )
+        source = rgb.convert(mode)
+
+        # Omit the lower-left block.  The other three share both seams and
+        # leave one explicitly uncovered output rectangle.
+        boxes = ((0, 0, 4, 3), (4, 0, 8, 3), (4, 3, 8, 6))
+        mesh = [
+            (box, (box[0], box[1], box[0], box[3], box[2], box[3], box[2], box[1]))
+            for box in boxes
+        ]
+
+        transformed = source.transform(
+            size,
+            Image.Transform.MESH,
+            mesh,
+            resample,
+            fillcolor=fillcolor,
+        )
+
+        fill = Image.new(mode, (1, 1), fillcolor).getpixel((0, 0))
+        assert isinstance(fill, tuple)
+        expected = Image.new(mode, size, fillcolor)
+        for box in boxes:
+            expected.paste(source.crop(box), box[:2])
+
+        assert transformed.size == size
+        assert_image_equal(transformed, expected)
+
+        for y in range(3, 6):
+            for x in range(4):
+                assert transformed.getpixel((x, y)) == fill
+        if mode in {"RGBA", "LA"} and fillcolor is None:
+            assert fill[-1] == 0
+
+    @pytest.mark.parametrize(
+        "resample",
+        (
+            Image.Resampling.NEAREST,
+            Image.Resampling.BILINEAR,
+            Image.Resampling.BICUBIC,
+        ),
+    )
+    @pytest.mark.parametrize(
+        "fillcolor,expected_fill",
+        (
+            (None, (0, 0, 0, 0)),
+            ("red", (255, 0, 0, 255)),
+        ),
+    )
+    def test_mesh_quad_outside_source_fill(
+        self,
+        resample: Image.Resampling,
+        fillcolor: str | None,
+        expected_fill: tuple[int, int, int, int],
+    ) -> None:
+        source = Image.new("RGBA", (4, 3))
+        source.putdata(
+            [
+                ((40 * x) % 256, (60 * y) % 256, 128, 255)
+                for y in range(source.height)
+                for x in range(source.width)
+            ]
+        )
+
+        size = (8, 5)
+        box = (2, 1, 6, 4)
+        # The left half of this quad is before x=0 in the source; its right
+        # half maps destination columns 4 and 5 to source columns 0 and 1.
+        quad = (-2, 0, -2, 3, 2, 3, 2, 0)
+        transformed = source.transform(
+            size,
+            Image.Transform.MESH,
+            [(box, quad)],
+            resample,
+            fillcolor=fillcolor,
+        )
+
+        expected = Image.new("RGBA", size, fillcolor)
+        expected.paste(source.crop((0, 0, 2, 3)), (4, 1))
+
+        assert transformed.size == size
+        assert_image_equal(transformed, expected)
+        for x in (2, 3):
+            for y in range(1, 4):
+                assert transformed.getpixel((x, y)) == expected_fill
+
+    @pytest.mark.parametrize(
+        "resample",
+        (Image.Resampling.BILINEAR, Image.Resampling.BICUBIC),
+    )
+    def test_mesh_alpha_premult(self, resample: Image.Resampling) -> None:
+        def op(im: Image.Image, size: tuple[int, int]) -> Image.Image:
+            w, h = im.size
+            return im.transform(
+                size,
+                Image.Transform.MESH,
+                [((0, 0, *size), (0, 0, 0, h, w, h, w, 0))],
+                resample,
+            )
+
+        self._test_alpha_premult(op)
+
+    @pytest.mark.parametrize("mode", ("RGBA", "LA"))
+    def test_mesh_nearest_alpha(self, mode: str) -> None:
+        def op(im: Image.Image, size: tuple[int, int]) -> Image.Image:
+            w, h = im.size
+            return im.transform(
+                size,
+                Image.Transform.MESH,
+                [((0, 0, *size), (0, 0, 0, h, w, h, w, 0))],
+                Image.Resampling.NEAREST,
+            )
+
+        self._test_nearest(op, mode)
+
     def _test_alpha_premult(
         self, op: Callable[[Image.Image, tuple[int, int]], Image.Image]
     ) -> None:
