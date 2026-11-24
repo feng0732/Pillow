@@ -14,7 +14,14 @@ from PIL import (
     UnidentifiedImageError,
     _binary,
 )
-from PIL.TiffImagePlugin import RESOLUTION_UNIT, X_RESOLUTION, Y_RESOLUTION
+from PIL.TiffImagePlugin import (
+    IMAGEDESCRIPTION,
+    IMAGELENGTH,
+    IMAGEWIDTH,
+    RESOLUTION_UNIT,
+    X_RESOLUTION,
+    Y_RESOLUTION,
+)
 
 from .helper import (
     assert_image_equal,
@@ -477,6 +484,251 @@ class TestFileTiff:
         with Image.open("Tests/images/multipage_out_of_order.tiff") as im:
             assert isinstance(im, TiffImagePlugin.TiffImageFile)
             assert im.n_frames == 3
+
+    @staticmethod
+    def _save_varied_multipage_tiff(outfile: Path) -> None:
+        # Build a multipage TIFF whose pages differ in mode, size, pixel
+        # content, resolution and page-level tags.
+        page_specs = [
+            # mode, size, color, (resolution unit, x res, y res), description
+            ("L", (10, 10), 10, (2, 100.0, 100.0), "page-zero"),
+            ("RGB", (12, 8), (200, 30, 30), (3, 100.0, 100.0), "page-one"),
+            ("RGBA", (20, 16), (0, 40, 200, 255), None, "page-two"),
+        ]
+        pages = []
+        for mode, size, color, resolution, description in page_specs:
+            page = Image.new(mode, size, color)
+            ifd = TiffImagePlugin.ImageFileDirectory_v2()
+            ifd[IMAGEDESCRIPTION] = description
+            if resolution is not None:
+                unit, x_resolution, y_resolution = resolution
+                ifd[RESOLUTION_UNIT] = unit
+                ifd[X_RESOLUTION] = TiffImagePlugin.IFDRational(x_resolution)
+                ifd[Y_RESOLUTION] = TiffImagePlugin.IFDRational(y_resolution)
+            page.encoderinfo = {"tiffinfo": ifd}
+            pages.append(page)
+        pages[0].save(outfile, save_all=True, append_images=pages[1:])
+
+    def test_multipage_page_pixels_and_size(self, tmp_path: Path) -> None:
+        # Each page's mode, size and pixel content must match that page's
+        # metadata rather than the page that was read before it.
+        outfile = tmp_path / "varied_pages.tiff"
+        self._save_varied_multipage_tiff(outfile)
+
+        expected = [
+            ("L", (10, 10), 10),
+            ("RGB", (12, 8), (200, 30, 30)),
+            ("RGBA", (20, 16), (0, 40, 200, 255)),
+        ]
+        with Image.open(outfile) as im:
+            assert isinstance(im, TiffImagePlugin.TiffImageFile)
+            assert im.n_frames == len(expected)
+
+            # Read the pages out of order, as a viewer may do.
+            for frame in (2, 0, 1, 0, 2):
+                im.seek(frame)
+                im.load()
+                mode, size, pixel = expected[frame]
+                assert im.tell() == frame
+                assert im.mode == mode
+                assert im.size == size
+                assert im.getpixel((0, 0)) == pixel
+                assert im.tag_v2[IMAGEWIDTH] == size[0]
+                assert im.tag_v2[IMAGELENGTH] == size[1]
+
+    def test_multipage_page_resolution(self, tmp_path: Path) -> None:
+        # Physical resolution must describe the current page, including the
+        # conversion from dots per centimeter to dots per inch.
+        outfile = tmp_path / "varied_pages.tiff"
+        self._save_varied_multipage_tiff(outfile)
+
+        with Image.open(outfile) as im:
+            assert isinstance(im, TiffImagePlugin.TiffImageFile)
+
+            # Page 0: dots per inch are reported unchanged.
+            im.seek(0)
+            assert im.tag_v2[RESOLUTION_UNIT] == 2
+            assert im.info["dpi"] == (100.0, 100.0)
+
+            # Page 1: dots per centimeter are converted to dots per inch.
+            im.seek(1)
+            assert im.tag_v2[RESOLUTION_UNIT] == 3
+            assert im.info["dpi"] == (254.0, 254.0)
+
+            # Page 2: no resolution information at all.
+            im.seek(2)
+            assert RESOLUTION_UNIT not in im.tag_v2
+            assert X_RESOLUTION not in im.tag_v2
+            assert Y_RESOLUTION not in im.tag_v2
+            assert "dpi" not in im.info
+            assert "resolution" not in im.info
+
+            # Going back must restore the earlier page's resolution.
+            im.seek(0)
+            assert im.info["dpi"] == (100.0, 100.0)
+
+    def test_multipage_page_tags_isolation(self, tmp_path: Path) -> None:
+        # Tags from an earlier page must not survive on later pages, and vice
+        # versa, when pages are visited in any order.
+        outfile = tmp_path / "varied_pages.tiff"
+        self._save_varied_multipage_tiff(outfile)
+
+        descriptions = ("page-zero", "page-one", "page-two")
+        with Image.open(outfile) as im:
+            assert isinstance(im, TiffImagePlugin.TiffImageFile)
+
+            for frame in (1, 2, 0, 2, 1):
+                im.seek(frame)
+                assert im.tag_v2[IMAGEDESCRIPTION] == descriptions[frame]
+
+            # Page 2 carries no resolution tags; visiting it then returning to
+            # page 1 must not leave page 2's missing resolution in place.
+            im.seek(2)
+            assert X_RESOLUTION not in im.tag_v2
+            im.seek(1)
+            assert im.tag_v2[X_RESOLUTION] == 100.0
+            assert im.tag_v2[RESOLUTION_UNIT] == 3
+
+            # The reverse direction must also be clean: page 1's resolution
+            # tags must not appear on the page that never had them.
+            im.seek(2)
+            assert X_RESOLUTION not in im.tag_v2
+            assert "dpi" not in im.info
+
+    def test_multipage_page_copy_and_export(self, tmp_path: Path) -> None:
+        # Copying or exporting the current page must capture that page alone,
+        # with no leakage from pages read earlier.
+        outfile = tmp_path / "varied_pages.tiff"
+        self._save_varied_multipage_tiff(outfile)
+
+        expected = [
+            ("L", (10, 10), 10, (100.0, 100.0)),
+            ("RGB", (12, 8), (200, 30, 30), (254.0, 254.0)),
+            ("RGBA", (20, 16), (0, 40, 200, 255), None),
+        ]
+        with Image.open(outfile) as im:
+            assert isinstance(im, TiffImagePlugin.TiffImageFile)
+
+            # Visit every page first so all IFDs have been loaded, then jump
+            # back and make per-page copies and exports.
+            for frame in range(im.n_frames):
+                im.seek(frame)
+            for frame in (2, 0, 1):
+                im.seek(frame)
+                im.load()
+                mode, size, pixel, dpi = expected[frame]
+
+                # A detached copy keeps the current page's pixels and the dpi
+                # resolved from that page's own tags.
+                copied = im.copy()
+                assert copied.mode == mode
+                assert copied.size == size
+                assert copied.getpixel((0, 0)) == pixel
+                assert copied.info.get("dpi") == dpi
+
+                # Exporting the current frame writes that frame alone, with
+                # its own pixel content, size and physical resolution.
+                export = tmp_path / f"exported_{frame}.tiff"
+                im.save(export)
+                with Image.open(export) as exported:
+                    assert exported.n_frames == 1
+                    assert exported.mode == mode
+                    assert exported.size == size
+                    assert exported.getpixel((0, 0)) == pixel
+                    assert exported.info.get("dpi") == dpi
+
+    def test_multipage_round_trip_seek_position(self, tmp_path: Path) -> None:
+        # tell()/seek() must locate the same page again after arbitrary moves,
+        # and exporting the current page must round-trip through a new TIFF
+        # file while keeping its pixels, size and resolution.
+        outfile = tmp_path / "varied_pages.tiff"
+        self._save_varied_multipage_tiff(outfile)
+
+        with Image.open(outfile) as im:
+            assert isinstance(im, TiffImagePlugin.TiffImageFile)
+            im.seek(2)
+            im.seek(0)
+            assert im.tell() == 0
+            im.seek(2)
+            assert im.tell() == 2
+            assert im.size == (20, 16)
+
+            im.seek(1)
+            assert im.tell() == 1
+            assert im.size == (12, 8)
+            assert im.info["dpi"] == (254.0, 254.0)
+            round_trip = tmp_path / "round_trip.tiff"
+            im.save(round_trip)
+
+        with Image.open(round_trip) as reloaded:
+            assert reloaded.n_frames == 1
+            assert reloaded.mode == "RGB"
+            assert reloaded.size == (12, 8)
+            assert reloaded.getpixel((0, 0)) == (200, 30, 30)
+            assert reloaded.info["dpi"] == (254.0, 254.0)
+
+    def test_multipage_resolution_unit_equivalence(self, tmp_path: Path) -> None:
+        # The same physical density expressed in different units must produce
+        # the same dpi, while a unitless (1) resolution and a missing one must
+        # not be mistaken for an absolute dpi.
+        inch_page = Image.new("L", (10, 10), 0)
+        inch_ifd = TiffImagePlugin.ImageFileDirectory_v2()
+        inch_ifd[RESOLUTION_UNIT] = 2
+        inch_ifd[X_RESOLUTION] = TiffImagePlugin.IFDRational(72)
+        inch_ifd[Y_RESOLUTION] = TiffImagePlugin.IFDRational(72)
+        inch_page.encoderinfo = {"tiffinfo": inch_ifd}
+
+        cm_page = Image.new("L", (10, 10), 1)
+        cm_ifd = TiffImagePlugin.ImageFileDirectory_v2()
+        cm_ifd[RESOLUTION_UNIT] = 3
+        # 72 dpi == 72 / 2.54 dots per centimeter
+        cm_ifd[X_RESOLUTION] = TiffImagePlugin.IFDRational(72 / 2.54)
+        cm_ifd[Y_RESOLUTION] = TiffImagePlugin.IFDRational(72 / 2.54)
+        cm_page.encoderinfo = {"tiffinfo": cm_ifd}
+
+        unitless_page = Image.new("L", (10, 10), 2)
+        unitless_ifd = TiffImagePlugin.ImageFileDirectory_v2()
+        unitless_ifd[RESOLUTION_UNIT] = 1
+        unitless_ifd[X_RESOLUTION] = TiffImagePlugin.IFDRational(72)
+        unitless_ifd[Y_RESOLUTION] = TiffImagePlugin.IFDRational(72)
+        unitless_page.encoderinfo = {"tiffinfo": unitless_ifd}
+
+        missing_page = Image.new("L", (10, 10), 3)
+
+        outfile = tmp_path / "resolution_units.tiff"
+        inch_page.save(
+            outfile,
+            save_all=True,
+            append_images=[cm_page, unitless_page, missing_page],
+        )
+
+        with Image.open(outfile) as im:
+            assert isinstance(im, TiffImagePlugin.TiffImageFile)
+            assert im.n_frames == 4
+
+            im.seek(0)
+            assert im.tag_v2[RESOLUTION_UNIT] == 2
+            assert im.info["dpi"] == (72.0, 72.0)
+
+            im.seek(1)
+            assert im.tag_v2[RESOLUTION_UNIT] == 3
+            assert im.info["dpi"] == pytest.approx((72.0, 72.0))
+
+            im.seek(2)
+            assert im.tag_v2[RESOLUTION_UNIT] == 1
+            # Unitless measurements are not an absolute dpi...
+            assert "dpi" not in im.info
+            # ...but the raw resolution is still exposed.
+            assert im.info["resolution"] == (72.0, 72.0)
+
+            im.seek(3)
+            assert RESOLUTION_UNIT not in im.tag_v2
+            assert "dpi" not in im.info
+            assert "resolution" not in im.info
+
+            # Earlier pages' values must not leak when revisiting.
+            im.seek(0)
+            assert im.info["dpi"] == (72.0, 72.0)
 
     def test___str__(self) -> None:
         filename = "Tests/images/pil136.tiff"
