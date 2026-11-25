@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import warnings
 from io import BytesIO
 from typing import Any
@@ -1568,3 +1569,657 @@ def test_p_rgba(tmp_path: Path, params: dict[str, Any]) -> None:
     with Image.open(out) as reloaded:
         assert isinstance(reloaded, GifImagePlugin.GifImageFile)
         assert reloaded.n_frames == 2
+
+
+# Pillow's encoder does not produce every combination of local palettes,
+# per-frame transparency indexes and disposal methods used below, so the
+# read-side fixtures in this section are written by hand.
+
+_RGB = tuple[int, int, int]
+_RGBA = tuple[int, int, int, int]
+
+_RED = (255, 0, 0)
+_GREEN = (0, 255, 0)
+_BLUE = (0, 0, 255)
+_YELLOW = (255, 255, 0)
+_WHITE = (255, 255, 255)
+
+_GLOBAL_PALETTE: list[_RGB] = [_RED, _GREEN, _BLUE, _WHITE]
+
+_LOADING_STRATEGIES = (
+    GifImagePlugin.LoadingStrategy.RGB_AFTER_FIRST,
+    GifImagePlugin.LoadingStrategy.RGB_AFTER_DIFFERENT_PALETTE_ONLY,
+    GifImagePlugin.LoadingStrategy.RGB_ALWAYS,
+)
+
+
+def _lzw(indices: list[int], min_code_size: int = 2) -> bytes:
+    """Encode palette indexes, emitting a clear code before every index."""
+    clear = 1 << min_code_size
+    codes: list[int] = []
+    for index in indices:
+        codes += [clear, index]
+    codes.append(clear + 1)
+
+    accumulator = 0
+    bits = 0
+    out = bytearray()
+    for code in codes:
+        accumulator |= code << bits
+        bits += min_code_size + 1
+        while bits >= 8:
+            out.append(accumulator & 0xFF)
+            accumulator >>= 8
+            bits -= 8
+    if bits:
+        out.append(accumulator & 0xFF)
+    return bytes(out)
+
+
+def _subblocks(data: bytes) -> bytes:
+    out = bytearray()
+    for i in range(0, len(data), 255):
+        chunk = data[i : i + 255]
+        out.append(len(chunk))
+        out += chunk
+    out.append(0)
+    return bytes(out)
+
+
+def _palette(colors: list[_RGB]) -> bytes:
+    """Pad a palette to the four entries of a 2-bit GIF colour table."""
+    assert 1 < len(colors) <= 4
+    padded = list(colors) + [(0, 0, 0)] * (4 - len(colors))
+    return b"".join(bytes(color) for color in padded)
+
+
+def _gce(disposal: int = 0, transparency: int | None = None) -> bytes:
+    """A graphic control extension."""
+    packed = (disposal << 2) | (1 if transparency is not None else 0)
+    return b"\x21\xf9\x04" + bytes(
+        [packed, 0, 0, transparency if transparency is not None else 0, 0]
+    )
+
+
+def _image(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    indices: list[int],
+    local_palette: list[_RGB] | None = None,
+) -> bytes:
+    """A local image descriptor with optional local colour table."""
+    packed = 0
+    table = b""
+    if local_palette is not None:
+        packed |= 0x80 | 0x01
+        table = _palette(local_palette)
+    return (
+        b"\x2c"
+        + struct.pack("<HHHH", x, y, width, height)
+        + bytes([packed])
+        + table
+        + bytes([2])
+        + _subblocks(_lzw(indices))
+    )
+
+
+def _gif(
+    width: int,
+    height: int,
+    frames: list[bytes],
+    background: int = 0,
+) -> bytes:
+    return (
+        b"GIF89a"
+        + struct.pack("<HH", width, height)
+        + bytes([0x80 | 0x01, background, 0])
+        + _palette(_GLOBAL_PALETTE)
+        + b"".join(frames)
+        + b"\x3b"
+    )
+
+
+def _visible(im: Image.Image) -> list[_RGBA | None]:
+    """Visible pixels; the colour of transparent pixels is not specified."""
+    return [
+        pixel if pixel[3] else None for pixel in im.convert("RGBA").get_flattened_data()
+    ]
+
+
+def _frames(im: Image.Image) -> list[list[_RGBA | None]]:
+    return [_visible(frame) for frame in ImageSequence.Iterator(im)]
+
+
+def _assert_frames_equal(
+    frames: list[Image.Image], reloaded: list[Image.Image]
+) -> None:
+    assert len(reloaded) == len(frames)
+    for i, (got, expected) in enumerate(zip(reloaded, frames)):
+        assert _visible(got) == _visible(expected), f"frame {i}"
+
+
+def _base_icon(size: tuple[int, int]) -> Image.Image:
+    """A red icon on a fully transparent canvas."""
+    im = Image.new("RGBA", size, (0, 0, 0, 0))
+    im.paste(_RED + (255,), (2, 2, 8, 8))
+    return im
+
+
+@pytest.mark.parametrize("strategy", _LOADING_STRATEGIES)
+def test_local_frames_overlay(
+    strategy: GifImagePlugin.LoadingStrategy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Partial frames with their own palettes pile up on the canvas."""
+    icon = [0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0]
+    # Local palette: 0 white, 1 blue, 2 red, 3 green
+    palette = [_WHITE, _BLUE, _RED, _GREEN]
+    data = _gif(
+        4,
+        4,
+        [
+            _gce(transparency=0) + _image(0, 0, 4, 4, icon),
+            _gce(transparency=0) + _image(1, 1, 2, 2, [1, 2, 2, 1], palette),
+            _gce(transparency=0) + _image(3, 3, 1, 1, [3], palette),
+        ],
+    )
+    monkeypatch.setattr(GifImagePlugin, "LOADING_STRATEGY", strategy)
+
+    green = _GREEN + (255,)
+    blue = _BLUE + (255,)
+    red = _RED + (255,)
+    with Image.open(BytesIO(data)) as im:
+        assert _frames(im) == [
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                green,
+                green,
+                None,
+                None,
+                green,
+                green,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                blue,
+                red,
+                None,
+                None,
+                red,
+                blue,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                blue,
+                red,
+                None,
+                None,
+                red,
+                blue,
+                None,
+                None,
+                None,
+                None,
+                green,
+            ],
+        ]
+
+
+@pytest.mark.parametrize("strategy", _LOADING_STRATEGIES)
+def test_disposal_background_clears_patch(
+    strategy: GifImagePlugin.LoadingStrategy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disposal method 2 clears the frame's patch, transparently if possible."""
+    icon = [1] * 16
+    palette = [_WHITE, _BLUE, _RED, _GREEN]
+    data = _gif(
+        4,
+        4,
+        [
+            _gce(transparency=0) + _image(0, 0, 4, 4, icon),
+            _gce(disposal=2, transparency=0) + _image(1, 1, 2, 2, [2] * 4, palette),
+            _gce(transparency=0) + _image(0, 0, 1, 1, [3]),
+        ],
+    )
+    monkeypatch.setattr(GifImagePlugin, "LOADING_STRATEGY", strategy)
+
+    green = _GREEN + (255,)
+    red = _RED + (255,)
+    white = _WHITE + (255,)
+    with Image.open(BytesIO(data)) as im:
+        frames = _frames(im)
+    # The second frame's own patch is red inside the green canvas.
+    assert frames[1] == [
+        green,
+        green,
+        green,
+        green,
+        green,
+        red,
+        red,
+        green,
+        green,
+        red,
+        red,
+        green,
+        green,
+        green,
+        green,
+        green,
+    ]
+    # The patch disposed by the second frame is gone in the third frame;
+    # the pixels outside of it survive.
+    assert frames[2] == [
+        white,
+        green,
+        green,
+        green,
+        green,
+        None,
+        None,
+        green,
+        green,
+        None,
+        None,
+        green,
+        green,
+        green,
+        green,
+        green,
+    ]
+
+
+@pytest.mark.parametrize("strategy", _LOADING_STRATEGIES)
+def test_disposal_background_uses_colour_without_transparency(
+    strategy: GifImagePlugin.LoadingStrategy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without transparency, disposal method 2 restores the background colour."""
+    data = _gif(
+        4,
+        1,
+        [
+            _gce() + _image(0, 0, 4, 1, [1, 1, 1, 1]),
+            _gce(disposal=2) + _image(1, 0, 2, 1, [3, 3]),
+            _gce() + _image(0, 0, 1, 1, [0]),
+        ],
+        background=2,
+    )
+    monkeypatch.setattr(GifImagePlugin, "LOADING_STRATEGY", strategy)
+
+    green = _GREEN + (255,)
+    blue = _BLUE + (255,)
+    red = _RED + (255,)
+    white = _WHITE + (255,)
+    with Image.open(BytesIO(data)) as im:
+        assert _frames(im) == [
+            [green] * 4,
+            [green, white, white, green],
+            [red, blue, blue, green],
+        ]
+
+
+@pytest.mark.parametrize("strategy", _LOADING_STRATEGIES)
+def test_disposal_previous_restores_canvas(
+    strategy: GifImagePlugin.LoadingStrategy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disposal method 3 restores the canvas to the frame before."""
+    icon = [0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0]
+    palette = [_WHITE, _BLUE, _RED, _GREEN]
+    data = _gif(
+        4,
+        4,
+        [
+            _gce(transparency=0) + _image(0, 0, 4, 4, icon),
+            _gce(disposal=3, transparency=0) + _image(1, 1, 2, 2, [2] * 4, palette),
+            _gce(transparency=0) + _image(0, 0, 1, 1, [3]),
+        ],
+    )
+    monkeypatch.setattr(GifImagePlugin, "LOADING_STRATEGY", strategy)
+
+    green = _GREEN + (255,)
+    red = _RED + (255,)
+    white = _WHITE + (255,)
+    with Image.open(BytesIO(data)) as im:
+        frames = _frames(im)
+    assert frames[1] == [
+        None,
+        None,
+        None,
+        None,
+        None,
+        red,
+        red,
+        None,
+        None,
+        red,
+        red,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+    # The first frame's icon comes back, and the third frame's mark is added.
+    assert frames[2] == [
+        white,
+        None,
+        None,
+        None,
+        None,
+        green,
+        green,
+        None,
+        None,
+        green,
+        green,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+
+
+@pytest.mark.parametrize("strategy", _LOADING_STRATEGIES)
+def test_transparency_index_is_per_frame(
+    strategy: GifImagePlugin.LoadingStrategy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The transparency index is interpreted against each frame's palette."""
+    data = _gif(
+        4,
+        1,
+        [
+            # Global palette: index 0 is red, which is transparent here.
+            _gce(transparency=0) + _image(0, 0, 4, 1, [1, 1, 1, 1]),
+            # Local palette: index 1 is green, which is transparent here.
+            _gce(transparency=1)
+            + _image(0, 0, 4, 1, [0, 1, 2, 3], [_WHITE, _GREEN, _BLUE, _RED]),
+            # Global palette again: index 3 (white) is transparent here.
+            _gce(transparency=3) + _image(0, 0, 4, 1, [0, 1, 2, 3]),
+        ],
+    )
+    monkeypatch.setattr(GifImagePlugin, "LOADING_STRATEGY", strategy)
+
+    green = _GREEN + (255,)
+    blue = _BLUE + (255,)
+    red = _RED + (255,)
+    white = _WHITE + (255,)
+    with Image.open(BytesIO(data)) as im:
+        assert _frames(im) == [
+            [green] * 4,
+            # The local transparent pixel is skipped, so that position keeps
+            # the green left by the previous frame.
+            [white, green, blue, red],
+            # The new transparent index is skipped too, so x3 keeps the red
+            # drawn by the previous frame instead of turning white.
+            [red, green, blue, red],
+        ]
+
+
+@pytest.mark.parametrize(
+    "order",
+    ([2, 1, 0], [1, 0, 2], [2, 0, 1], [1, 2, 0], [0, 2, 1], [0, 1, 2, 0, 1]),
+)
+@pytest.mark.parametrize("strategy", _LOADING_STRATEGIES)
+def test_seek_repeatable(
+    order: list[int],
+    strategy: GifImagePlugin.LoadingStrategy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seeking to a frame gives the same picture regardless of the path taken."""
+    icon = [0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0]
+    palette = [_WHITE, _BLUE, _RED, _GREEN]
+    data = _gif(
+        4,
+        4,
+        [
+            _gce(transparency=0) + _image(0, 0, 4, 4, icon),
+            _gce(disposal=2, transparency=0) + _image(1, 1, 2, 2, [1] * 4, palette),
+            _gce(disposal=3, transparency=0) + _image(2, 2, 2, 2, [2] * 4, palette),
+            _gce(transparency=0) + _image(0, 3, 4, 1, [3, 0, 3, 0], palette),
+        ],
+    )
+    monkeypatch.setattr(GifImagePlugin, "LOADING_STRATEGY", strategy)
+
+    expected: dict[int, list[_RGBA | None]] = {}
+    with Image.open(BytesIO(data)) as im:
+        for i in range(4):
+            im.seek(i)
+            expected[i] = _visible(im)
+
+    with Image.open(BytesIO(data)) as im:
+        for i in order:
+            im.seek(i)
+            assert _visible(im) == expected[i], f"frame {i} after seeking {order}"
+
+
+@pytest.mark.parametrize("disposal", (3, [1, 3, 3, 1, 3]))
+@pytest.mark.parametrize("optimize", (False, True))
+def test_save_disposal_previous_rgb(
+    disposal: int | list[int], optimize: bool, tmp_path: Path
+) -> None:
+    """Frames after a disposal method 3 frame show that frame's canvas."""
+    frame0 = Image.new("RGB", (8, 8), _RED)
+    frame1 = frame0.copy()
+    frame1.paste(_GREEN, (0, 0, 4, 4))
+    frame2 = frame1.copy()
+    frame2.paste(_BLUE, (4, 4, 8, 8))
+    frames = [frame0, frame1, frame2, frame0, frame2]
+
+    out = tmp_path / "temp.gif"
+    frames[0].save(
+        out,
+        save_all=True,
+        append_images=frames[1:],
+        disposal=disposal,
+        duration=10,
+        optimize=optimize,
+    )
+
+    with Image.open(out) as reloaded:
+        assert isinstance(reloaded, GifImagePlugin.GifImageFile)
+        assert reloaded.n_frames == len(frames)
+        for i, frame in enumerate(frames):
+            reloaded.seek(i)
+            assert reloaded.convert("RGB").tobytes() == frame.tobytes(), f"frame {i}"
+
+
+@pytest.mark.parametrize("disposal", (3, [3, 3, 3, 3, 3]))
+@pytest.mark.parametrize("optimize", (False, True))
+def test_save_disposal_previous_transparent_icon(
+    disposal: int | list[int], optimize: bool, tmp_path: Path
+) -> None:
+    """A transparent icon updated by local changes keeps its transparency."""
+    frames = [_base_icon((10, 10)) for _ in range(5)]
+    frames[1].paste(_GREEN + (255,), (3, 3, 6, 6))
+    frames[2].paste(_GREEN + (255,), (3, 3, 6, 6))
+    frames[2].paste(_BLUE + (255,), (0, 5, 4, 9))
+    frames[3].paste(_BLUE + (255,), (0, 5, 4, 9))
+    frames[4].paste(_YELLOW + (255,), (6, 6, 9, 9))
+
+    out = tmp_path / "temp.gif"
+    frames[0].save(
+        out,
+        save_all=True,
+        append_images=frames[1:],
+        disposal=disposal,
+        duration=10,
+        optimize=optimize,
+    )
+
+    reloaded = []
+    with Image.open(out) as im:
+        assert isinstance(im, GifImagePlugin.GifImageFile)
+        for i in range(im.n_frames):
+            im.seek(i)
+            reloaded.append(im.convert("RGBA"))
+    _assert_frames_equal(frames, reloaded)
+
+
+@pytest.mark.parametrize("disposal", (3, [3, 3, 3, 3, 3]))
+@pytest.mark.parametrize("optimize", (False, True))
+def test_save_disposal_previous_palette_transparency(
+    disposal: int | list[int], optimize: bool, tmp_path: Path
+) -> None:
+    """Indexed frames keep their transparency index when disposed to previous."""
+    colours: list[_RGB] = [(0, 0, 0), _RED, _GREEN, _BLUE, _YELLOW]
+
+    def frame_with(indexes: dict[tuple[int, int], int]) -> Image.Image:
+        im = Image.new("P", (10, 10), 0)
+        palette = [channel for colour in colours for channel in colour]
+        im.putpalette(palette + [0] * (768 - len(palette)))
+        for y in range(2, 8):
+            for x in range(2, 8):
+                im.putpixel((x, y), 1)
+        for (x, y), index in indexes.items():
+            im.putpixel((x, y), index)
+        im.info["transparency"] = 0
+        return im
+
+    frames = [
+        frame_with({}),
+        frame_with({(x, y): 2 for y in range(3, 6) for x in range(3, 6)}),
+        frame_with({(x, y): 3 for y in range(5, 9) for x in range(4)}),
+        frame_with({(x, y): 4 for y in range(6, 9) for x in range(6, 9)}),
+        frame_with({}),
+    ]
+
+    out = tmp_path / "temp.gif"
+    frames[0].save(
+        out,
+        save_all=True,
+        append_images=frames[1:],
+        disposal=disposal,
+        duration=10,
+        optimize=optimize,
+    )
+
+    reloaded = []
+    with Image.open(out) as im:
+        assert isinstance(im, GifImagePlugin.GifImageFile)
+        assert im.n_frames == len(frames)
+        for i in range(im.n_frames):
+            im.seek(i)
+            reloaded.append(im.convert("RGBA"))
+    _assert_frames_equal(frames, reloaded)
+
+
+@pytest.mark.parametrize("order", ([2, 1, 0], [1, 0, 2], [2, 0, 1], [0, 2, 1]))
+def test_save_disposal_previous_seek_repeatable(
+    order: list[int], tmp_path: Path
+) -> None:
+    """A file saved with disposal method 3 reads the same in any seek order."""
+    frame0 = Image.new("RGB", (8, 8), _RED)
+    frame1 = frame0.copy()
+    frame1.paste(_GREEN, (0, 0, 4, 4))
+    frame2 = frame1.copy()
+    frame2.paste(_BLUE, (4, 4, 8, 8))
+    frames = [frame0, frame1, frame2]
+
+    out = tmp_path / "temp.gif"
+    frames[0].save(
+        out, save_all=True, append_images=frames[1:], disposal=3, duration=10
+    )
+
+    with Image.open(out) as im:
+        expected = []
+        for i in range(len(frames)):
+            im.seek(i)
+            expected.append(im.convert("RGB").tobytes())
+
+    with Image.open(out) as im:
+        for i in order:
+            im.seek(i)
+            assert im.convert("RGB").tobytes() == expected[i], f"frame {i}"
+            assert im.convert("RGB").tobytes() == frames[i].tobytes(), f"frame {i}"
+
+
+@pytest.mark.parametrize("strategy", _LOADING_STRATEGIES)
+def test_local_palette_switches_colours(
+    strategy: GifImagePlugin.LoadingStrategy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same index resolves to each frame's own colour."""
+    data = _gif(
+        4,
+        1,
+        [
+            _gce(transparency=0)
+            + _image(0, 0, 4, 1, [1] * 4, [_WHITE, _RED, _GREEN, _BLUE]),
+            _gce(transparency=0)
+            + _image(0, 0, 4, 1, [1] * 4, [_WHITE, _GREEN, _BLUE, _RED]),
+        ],
+    )
+    monkeypatch.setattr(GifImagePlugin, "LOADING_STRATEGY", strategy)
+
+    red = _RED + (255,)
+    green = _GREEN + (255,)
+    with Image.open(BytesIO(data)) as im:
+        assert _frames(im) == [[red] * 4, [green] * 4]
+
+
+@pytest.mark.parametrize("disposal", (3, [3, 3, 3, 3, 3]))
+@pytest.mark.parametrize("optimize", (False, True))
+def test_save_disposal_previous_local_colour_tables(
+    disposal: int | list[int], optimize: bool, tmp_path: Path
+) -> None:
+    """Frames with their own colour tables survive disposal method 3."""
+    green_badge = {(x, y): _GREEN for y in range(3, 6) for x in range(3, 6)}
+    blue_bar = {(x, y): _BLUE for y in range(5, 9) for x in range(4)}
+    frames = []
+    for changes in (
+        {},
+        green_badge,
+        {**green_badge, **blue_bar},
+        blue_bar,
+        {(x, y): _YELLOW for y in range(6, 9) for x in range(6, 9)},
+    ):
+        im = Image.new("RGB", (10, 10), _WHITE)
+        for y in range(2, 8):
+            for x in range(2, 8):
+                im.putpixel((x, y), _RED)
+        for (x, y), colour in changes.items():
+            im.putpixel((x, y), colour)
+        frames.append(im.convert("P", palette=Image.Palette.ADAPTIVE, colors=8))
+
+    out = tmp_path / "temp.gif"
+    frames[0].save(
+        out,
+        save_all=True,
+        append_images=frames[1:],
+        disposal=disposal,
+        duration=10,
+        include_color_table=True,
+        optimize=optimize,
+    )
+
+    reloaded = []
+    with Image.open(out) as im:
+        assert isinstance(im, GifImagePlugin.GifImageFile)
+        assert im.n_frames == len(frames)
+        for i in range(im.n_frames):
+            im.seek(i)
+            reloaded.append(im.convert("RGBA"))
+    _assert_frames_equal(frames, reloaded)
