@@ -1568,3 +1568,320 @@ def test_p_rgba(tmp_path: Path, params: dict[str, Any]) -> None:
     with Image.open(out) as reloaded:
         assert isinstance(reloaded, GifImagePlugin.GifImageFile)
         assert reloaded.n_frames == 2
+
+
+def _gif_graphic_control_extensions(data: bytes) -> list[tuple[int, int]]:
+    """Return ``(packed_fields, transparency_index)`` for every GCE in a GIF."""
+    extensions = []
+    start = 0
+    while True:
+        position = data.find(b"!\xf9", start)
+        if position == -1:
+            return extensions
+        # GCE layout: "!" 0xF9, block size, packed fields, duration (2 bytes),
+        # transparency index, block terminator.
+        extensions.append((data[position + 3], data[position + 6]))
+        start = position + 2
+
+
+def _gif_image_descriptors(data: bytes) -> list[tuple[tuple[int, int], tuple[int, int], int]]:
+    """Return ``(offset, size, flags)`` for every image descriptor in a GIF."""
+    descriptors = []
+    start = 0
+    while True:
+        position = data.find(b",", start)
+        if position == -1:
+            return descriptors
+        offset = (
+            data[position + 1] + 256 * data[position + 2],
+            data[position + 3] + 256 * data[position + 4],
+        )
+        size = (
+            data[position + 5] + 256 * data[position + 6],
+            data[position + 7] + 256 * data[position + 8],
+        )
+        descriptors.append((offset, size, data[position + 9]))
+        start = position + 1
+
+
+def _game_icon_palette() -> list[int]:
+    # A sparse palette with holes: the transparent entry lives at a high
+    # index so that palette optimization must remap it to a lower index.
+    palette = [0] * 768
+    colors = {
+        1: (255, 0, 0),  # red
+        2: (0, 255, 0),  # green body
+        3: (0, 0, 255),  # blue detail
+        10: (255, 0, 255),  # transparent background
+        20: (255, 255, 255),  # white highlight
+    }
+    for index, color in colors.items():
+        palette[index * 3 : index * 3 + 3] = color
+    return palette
+
+
+def _make_game_icon(size: int = 16, transparent_index: int = 10) -> Image.Image:
+    im = Image.new("P", (size, size), transparent_index)
+    im.putpalette(_game_icon_palette())
+    drawing = ImageDraw.Draw(im)
+    # Leave a one-pixel transparent border around the opaque body.
+    drawing.rectangle([1, 1, size - 2, size - 2], fill=2)
+    drawing.rectangle([5, 5, 8, 8], fill=3)
+    im.putpixel((size - 4, size - 4), 20)
+    im.info["transparency"] = transparent_index
+    return im
+
+
+def _assert_icon_border_transparent(im: Image.Image) -> None:
+    rgba = im.convert("RGBA")
+    width, height = rgba.size
+    border = (
+        [(x, 0) for x in range(width)]
+        + [(x, height - 1) for x in range(width)]
+        + [(0, y) for y in range(height)]
+        + [(width - 1, y) for y in range(height)]
+    )
+    for xy in border:
+        assert rgba.getpixel(xy)[3] == 0
+
+
+def test_optimized_transparency_remap() -> None:
+    # A game icon whose transparent color sits at a high palette index.
+    # Optimizing the GIF collapses palette holes, so the transparency marker
+    # has to be remapped together with the pixel indices.
+    im = _make_game_icon()
+
+    out = BytesIO()
+    im.save(out, "GIF", optimize=True)
+    data = out.getvalue()
+
+    packed, transparency_index = _gif_graphic_control_extensions(data)[0]
+    assert packed & 1  # transparency bit is set
+
+    with Image.open(BytesIO(data)) as reloaded:
+        assert isinstance(reloaded, GifImagePlugin.GifImageFile)
+        assert reloaded.info["transparency"] == transparency_index
+        # The remapped index must be lower than the original sparse index.
+        assert transparency_index < 10
+        # Every background pixel must point at the remapped transparent index.
+        assert reloaded.getpixel((0, 0)) == transparency_index
+        assert reloaded.getpixel((15, 15)) == transparency_index
+
+        rgba = reloaded.convert("RGBA")
+        # The transparent background keeps its meaning instead of becoming
+        # an opaque palette color.
+        assert rgba.getpixel((0, 0)) == (255, 0, 255, 0)
+        # Opaque pixels are visually unchanged.
+        assert rgba.getpixel((3, 3)) == (0, 255, 0, 255)
+        assert rgba.getpixel((6, 6)) == (0, 0, 255, 255)
+        assert rgba.getpixel((12, 12)) == (255, 255, 255, 255)
+        _assert_icon_border_transparent(reloaded)
+
+
+def test_optimized_and_unoptimized_gif_are_visually_equal() -> None:
+    # Palette remapping must not change the rendered image: the optimized
+    # and non-optimized GIFs decode to the same RGBA pixels.
+    im = _make_game_icon()
+
+    optimized = BytesIO()
+    im.save(optimized, "GIF", optimize=True)
+    plain = BytesIO()
+    im.save(plain, "GIF", optimize=False)
+
+    with Image.open(optimized) as optimized_im, Image.open(plain) as plain_im:
+        assert_image_equal(
+            optimized_im.convert("RGBA"), plain_im.convert("RGBA")
+        )
+
+    # The non-optimized file keeps the original high index, while the
+    # optimized file remaps it; both must still mark those pixels transparent.
+    assert _gif_graphic_control_extensions(plain.getvalue())[0][1] == 10
+    assert _gif_graphic_control_extensions(optimized.getvalue())[0][1] < 10
+
+
+def test_animated_icon_transparency_remap() -> None:
+    # Every frame of an animated icon has its transparent entry at a high
+    # palette index. After optimization each frame's GCE transparency index
+    # has to match the indices actually used by that frame's pixels, and the
+    # frame order and untouched regions must survive the round trip.
+    frames = []
+    for body_index in (2, 1, 3):
+        frame = _make_game_icon()
+        drawing = ImageDraw.Draw(frame)
+        drawing.rectangle([1, 1, 14, 14], fill=body_index)
+        # Redraw the shared opaque detail after repainting the body.
+        drawing.rectangle([5, 5, 8, 8], fill=3)
+        frame.info["transparency"] = 10
+        frames.append(frame)
+    durations = [100, 200, 300]
+
+    out = BytesIO()
+    frames[0].save(
+        out,
+        "GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        optimize=True,
+    )
+    data = out.getvalue()
+
+    extensions = _gif_graphic_control_extensions(data)
+    assert len(extensions) == len(frames)
+    for packed, transparency_index in extensions:
+        assert packed & 1
+        assert transparency_index < 10
+
+    expected_bodies = [(0, 255, 0), (255, 0, 0), (0, 0, 255)]
+    with Image.open(BytesIO(data)) as reloaded:
+        assert isinstance(reloaded, GifImagePlugin.GifImageFile)
+        assert reloaded.n_frames == len(frames)
+        assert reloaded.info["loop"] == 0
+
+        for index, frame in enumerate(ImageSequence.Iterator(reloaded)):
+            assert frame.info["duration"] == durations[index]
+            rgba = frame.convert("RGBA")
+            # Transparent border is preserved on every frame.
+            assert rgba.getpixel((0, 0))[3] == 0
+            assert rgba.getpixel((15, 15))[3] == 0
+            # Opaque body color appears in the expected frame order.
+            assert rgba.getpixel((4, 4)) == (*expected_bodies[index], 255)
+            # The shared opaque detail is untouched in every frame.
+            assert rgba.getpixel((6, 6)) == (0, 0, 255, 255)
+
+
+def test_local_frame_transparency_matches_local_palette() -> None:
+    # When a delta frame carries its own local color table, the transparent
+    # index in its GCE refers to that local table, not the global one.
+    # Build frames with different palettes where index 0 means different
+    # RGB colors, so a mismatched marker would render the background opaque.
+    first_colors = [(255, 0, 255), (255, 0, 0), (0, 0, 255), (0, 255, 0)]
+    second_colors = [(12, 34, 56), (200, 100, 50), (90, 90, 90), (10, 200, 240)]
+
+    def frame_with_palette(colors: list[tuple[int, int, int]], detail: bool) -> Image.Image:
+        frame = Image.new("P", (16, 16), 0)
+        palette = [channel for color in colors for channel in color]
+        palette += [0] * (768 - len(palette))
+        frame.putpalette(palette)
+        drawing = ImageDraw.Draw(frame)
+        drawing.rectangle([1, 1, 14, 14], fill=3)
+        if detail:
+            drawing.rectangle([10, 10, 12, 12], fill=2)
+        frame.info["transparency"] = 0
+        return frame
+
+    first = frame_with_palette(first_colors, detail=False)
+    second = frame_with_palette(second_colors, detail=True)
+
+    out = BytesIO()
+    first.save(
+        out,
+        "GIF",
+        save_all=True,
+        append_images=[second],
+        duration=[100, 100],
+        optimize=True,
+    )
+    data = out.getvalue()
+
+    descriptors = _gif_image_descriptors(data)
+    assert len(descriptors) == 2
+    # The second frame uses a local color table.
+    assert descriptors[0][2] & 128 == 0
+    assert descriptors[1][2] & 128
+
+    # Both GCEs declare transparency, and the indices are valid within their
+    # respective (global/local) tables.
+    for packed, transparency_index in _gif_graphic_control_extensions(data):
+        assert packed & 1
+        assert transparency_index == 0
+
+    with Image.open(BytesIO(data)) as reloaded:
+        assert isinstance(reloaded, GifImagePlugin.GifImageFile)
+        assert reloaded.n_frames == 2
+        _assert_icon_border_transparent(reloaded)
+
+        reloaded.seek(1)
+        rgba = reloaded.convert("RGBA")
+        # The local-table background stays transparent rather than taking on
+        # the first frame's global palette color.
+        assert rgba.getpixel((0, 0))[3] == 0
+        assert rgba.getpixel((7, 0))[3] == 0
+        # Colors from the second frame's own local palette render correctly.
+        assert rgba.getpixel((5, 5)) == (10, 200, 240, 255)
+        assert rgba.getpixel((11, 11)) == (90, 90, 90, 255)
+
+
+def test_partial_delta_frame_preserves_untouched_region() -> None:
+    # With one shared palette and a small per-frame change, only the changed
+    # rectangle is encoded as a local frame. The transparency marker of the
+    # remapped palette must match the local indices, and pixels outside the
+    # rectangle must remain exactly as they were in the previous frame.
+    palette = [0] * 768
+    colors = {
+        1: (255, 0, 0),
+        2: (0, 255, 0),
+        3: (0, 0, 255),
+        4: (90, 90, 90),
+        200: (120, 120, 120),  # transparent entry, high index with holes
+    }
+    for index, color in colors.items():
+        palette[index * 3 : index * 3 + 3] = color
+
+    def make_frame(changed: bool) -> Image.Image:
+        frame = Image.new("P", (16, 16), 200)
+        frame.putpalette(palette)
+        drawing = ImageDraw.Draw(frame)
+        drawing.rectangle([1, 1, 14, 14], fill=1)
+        if changed:
+            drawing.rectangle([10, 10, 12, 12], fill=4)
+        frame.info["transparency"] = 200
+        return frame
+
+    first = make_frame(changed=False)
+    second = make_frame(changed=True)
+
+    out = BytesIO()
+    first.save(
+        out,
+        "GIF",
+        save_all=True,
+        append_images=[second],
+        duration=[100, 100],
+        optimize=True,
+    )
+    data = out.getvalue()
+
+    descriptors = _gif_image_descriptors(data)
+    assert len(descriptors) == 2
+    # First frame covers the whole canvas; the second is a partial frame.
+    assert descriptors[0][0] == (0, 0)
+    assert descriptors[0][1] == (16, 16)
+    assert descriptors[1][0] == (10, 10)
+    assert descriptors[1][1] == (3, 3)
+
+    # Each frame's GCE transparency index must be the remapped local index
+    # (the original entry 200 collapses into the compacted palettes), and it
+    # must stay in sync with the indices written into that frame's pixels.
+    extensions = _gif_graphic_control_extensions(data)
+    assert [packed for packed, _ in extensions] == [1, 1]
+    assert [transparency_index for _, transparency_index in extensions] == [1, 2]
+
+    with Image.open(BytesIO(data)) as reloaded:
+        assert isinstance(reloaded, GifImagePlugin.GifImageFile)
+        assert reloaded.n_frames == 2
+        first_rgba = reloaded.convert("RGBA")
+
+        reloaded.seek(1)
+        second_rgba = reloaded.convert("RGBA")
+
+    # The changed rectangle is updated in the second frame.
+    assert second_rgba.getpixel((11, 11)) == (90, 90, 90, 255)
+    # Pixels outside the partial frame are untouched by the second frame.
+    assert second_rgba.getpixel((5, 5)) == first_rgba.getpixel((5, 5))
+    assert second_rgba.getpixel((14, 14)) == first_rgba.getpixel((14, 14))
+    # Transparent borders are still transparent in both frames.
+    assert first_rgba.getpixel((0, 0))[3] == 0
+    assert second_rgba.getpixel((0, 0))[3] == 0
+    assert second_rgba.getpixel((15, 15))[3] == 0
