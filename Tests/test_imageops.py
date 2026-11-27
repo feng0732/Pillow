@@ -747,6 +747,290 @@ def test_autocontrast_preserve_one_color(color: tuple[int, int, int]) -> None:
     assert_image_equal(img, out)
 
 
+def test_autocontrast_weight_alpha_la() -> None:
+    # The transparent pixel carries value 0, which must not pull the stretch
+    im = Image.new("LA", (3, 1))
+    im.putpixel((0, 0), (0, 0))
+    im.putpixel((1, 0), (50, 255))
+    im.putpixel((2, 0), (200, 255))
+
+    result = ImageOps.autocontrast(im, weight_alpha=True)
+
+    assert result.mode == "LA"
+    # Only 50 and 200 participate, so they map to 0 and 255
+    assert list(result.getchannel("L").get_flattened_data()) == [0, 0, 255]
+    # The alpha channel is left untouched
+    assert list(result.getchannel("A").get_flattened_data()) == [0, 255, 255]
+    # The input image and its pixel data are not modified
+    assert list(im.get_flattened_data()) == [(0, 0), (50, 255), (200, 255)]
+
+
+def test_autocontrast_weight_alpha_rgba() -> None:
+    im = Image.new("RGBA", (3, 1))
+    im.putpixel((0, 0), (0, 0, 0, 0))
+    im.putpixel((1, 0), (50, 60, 70, 128))
+    im.putpixel((2, 0), (200, 210, 220, 255))
+
+    result = ImageOps.autocontrast(im, weight_alpha=True)
+
+    assert result.mode == "RGBA"
+    # Per-channel stretch between the two visible endpoints, alpha untouched
+    assert result.getpixel((1, 0)) == (0, 0, 0, 128)
+    assert result.getpixel((2, 0)) == (255, 255, 255, 255)
+    assert result.getpixel((0, 0))[3] == 0
+    assert list(result.getchannel("A").get_flattened_data()) == [0, 128, 255]
+    # The mapping is applied to the whole image, including transparent pixels
+    assert result.getpixel((0, 0))[:3] == (0, 0, 0)
+
+
+def test_autocontrast_weight_alpha_partial_weight() -> None:
+    # A nearly transparent outlier carries little weight, so a cutoff that
+    # ignores it must not shift the visible stretch
+    im = Image.new("LA", (3, 1))
+    im.putpixel((0, 0), (0, 10))
+    im.putpixel((1, 0), (100, 255))
+    im.putpixel((2, 0), (255, 255))
+
+    # Total weight is 10 + 255 + 255 = 520 and a 10 percent cut is 52. The
+    # transparent value 0 (weight 10) is removed, so the stretch runs from
+    # 100 to 255
+    result = ImageOps.autocontrast(im, weight_alpha=True, cutoff=10)
+    assert list(result.getchannel("L").get_flattened_data()) == [0, 0, 255]
+
+    # Without weighting each pixel counts once; a 10 percent cut of three
+    # pixels rounds down to zero, so the outlier keeps the full range
+    plain = Image.new("L", (3, 1))
+    plain.putpixel((0, 0), 0)
+    plain.putpixel((1, 0), 100)
+    plain.putpixel((2, 0), 255)
+    reference = ImageOps.autocontrast(plain, cutoff=10)
+    assert list(reference.get_flattened_data()) == [0, 100, 255]
+
+
+def test_autocontrast_weight_alpha_mask() -> None:
+    im = Image.new("RGBA", (4, 1))
+    for x, value in enumerate((0, 30, 200, 255)):
+        im.putpixel((x, 0), (value, value, value, 255))
+    mask = Image.new("L", (4, 1), 0)
+    mask.putpixel((1, 0), 255)
+    mask.putpixel((2, 0), 255)
+
+    result = ImageOps.autocontrast(im, weight_alpha=True, mask=mask)
+
+    # Only the 30 and 200 pixels define the stretch, but it is applied to
+    # the entire image
+    assert [px[0] for px in result.get_flattened_data()] == [0, 0, 255, 255]
+    assert list(result.getchannel("A").get_flattened_data()) == [255] * 4
+
+
+def test_autocontrast_weight_alpha_mask_size_mismatch() -> None:
+    im = Image.new("RGBA", (4, 1))
+    mask = Image.new("L", (3, 1))
+
+    with pytest.raises(ValueError, match="images do not match"):
+        ImageOps.autocontrast(im, weight_alpha=True, mask=mask)
+
+
+def test_autocontrast_weight_alpha_mask_bad_mode() -> None:
+    im = Image.new("RGBA", (2, 1))
+    mask = Image.new("RGB", (2, 1))
+
+    with pytest.raises(ValueError, match="bad transparency mask"):
+        ImageOps.autocontrast(im, weight_alpha=True, mask=mask)
+
+
+def test_autocontrast_weight_alpha_mask_without_alpha() -> None:
+    # The region mask must still restrict statistics when the image has no
+    # alpha channel of its own
+    mask = Image.new("L", (4, 1), 0)
+    mask.putpixel((1, 0), 255)
+    mask.putpixel((2, 0), 255)
+
+    gray = Image.new("L", (4, 1))
+    for x, value in enumerate((0, 40, 160, 255)):
+        gray.putpixel((x, 0), value)
+    result = ImageOps.autocontrast(gray, weight_alpha=True, mask=mask)
+    assert list(result.get_flattened_data()) == [0, 0, 255, 255]
+
+    palette = Image.new("P", (4, 1))
+    palette.putpalette([0, 0, 0, 40, 40, 40, 160, 160, 160, 255, 255, 255])
+    for x in range(4):
+        palette.putpixel((x, 0), x)
+    result = ImageOps.autocontrast(palette, weight_alpha=True, mask=mask)
+    assert result.getpalette() == [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+    ]
+
+
+def test_autocontrast_weight_alpha_cutoff_tuple() -> None:
+    im = Image.new("LA", (4, 1))
+    im.putpixel((0, 0), (0, 255))
+    im.putpixel((1, 0), (10, 10))
+    im.putpixel((2, 0), (200, 255))
+    im.putpixel((3, 0), (255, 255))
+
+    # The semi-transparent value 10 carries too little weight to survive a
+    # 50 percent cut, leaving a single visible level and hence an identity
+    result = ImageOps.autocontrast(im, weight_alpha=True, cutoff=(50, 50))
+    assert list(result.getchannel("L").get_flattened_data()) == [0, 10, 200, 255]
+
+
+@pytest.mark.parametrize(
+    "mode, palette_mode, palette, expected_alphas",
+    (
+        # An RGBA palette carries an alpha value per entry
+        (
+            "P",
+            "RGBA",
+            [0, 0, 0, 0, 50, 60, 70, 128, 200, 210, 220, 255],
+            [0, 128, 255],
+        ),
+        # An RGB palette with one fully transparent palette entry
+        ("P", "RGB", [0, 0, 0, 50, 60, 70, 200, 210, 220], [0, 255, 255]),
+    ),
+)
+def test_autocontrast_weight_alpha_palette(
+    mode: str,
+    palette_mode: str,
+    palette: list[int],
+    expected_alphas: list[int],
+) -> None:
+    im = Image.new(mode, (3, 1))
+    im.putpalette(palette, palette_mode)
+    im.putpixel((0, 0), 0)
+    im.putpixel((1, 0), 1)
+    im.putpixel((2, 0), 2)
+    if palette_mode == "RGB":
+        # The first palette entry is the transparent one
+        im.info["transparency"] = 0
+
+    result = ImageOps.autocontrast(im, weight_alpha=True)
+
+    assert result.mode == mode
+    # Pixel indexes are never remapped
+    assert list(result.get_flattened_data()) == [0, 1, 2]
+    result_colors = result.convert("RGBA")
+    # Each channel is stretched between its own visible endpoints
+    assert result_colors.getpixel((1, 0))[:3] == (0, 17, 34)
+    assert result_colors.getpixel((2, 0))[:3] == (255, 255, 255)
+    # Visibility semantics are preserved through the palette
+    assert [result_colors.getpixel((x, 0))[3] for x in range(3)] == expected_alphas
+    # Original palette and transparency info are untouched
+    assert im.getpalette(palette_mode) == palette
+    if palette_mode == "RGB":
+        assert im.info["transparency"] == 0
+
+
+def test_autocontrast_weight_alpha_palette_transparency_bytes() -> None:
+    im = Image.new("P", (3, 1))
+    im.putpalette([0, 0, 0, 50, 60, 70, 200, 210, 220])
+    im.putpixel((0, 0), 0)
+    im.putpixel((1, 0), 1)
+    im.putpixel((2, 0), 2)
+    im.info["transparency"] = bytes([0, 128, 255])
+
+    result = ImageOps.autocontrast(im, weight_alpha=True)
+
+    assert result.mode == "P"
+    assert result.info["transparency"] == bytes([0, 128, 255])
+    rgba = result.convert("RGBA")
+    assert rgba.getpixel((0, 0))[3] == 0
+    assert rgba.getpixel((1, 0))[3] == 128
+    assert rgba.getpixel((2, 0))[3] == 255
+
+
+def test_autocontrast_weight_alpha_pa() -> None:
+    im = Image.new("PA", (3, 1))
+    im.putpalette([0, 0, 0, 50, 60, 70, 200, 210, 220], "RGB")
+    im.putpixel((0, 0), (0, 0))
+    im.putpixel((1, 0), (1, 128))
+    im.putpixel((2, 0), (2, 255))
+
+    result = ImageOps.autocontrast(im, weight_alpha=True)
+
+    assert result.mode == "PA"
+    assert list(result.getchannel("A").get_flattened_data()) == [0, 128, 255]
+    assert list(result.getchannel("P").get_flattened_data()) == [0, 1, 2]
+    # The palette colors were stretched, alpha band kept separately
+    assert result.getpalette() == [0, 0, 0, 0, 17, 34, 255, 255, 255]
+
+
+def test_autocontrast_weight_alpha_preserve_tone() -> None:
+    im = Image.new("RGBA", (3, 1))
+    im.putpixel((0, 0), (0, 0, 0, 0))
+    im.putpixel((1, 0), (50, 60, 70, 128))
+    im.putpixel((2, 0), (200, 210, 220, 255))
+
+    per_channel = ImageOps.autocontrast(im, weight_alpha=True)
+    preserved = ImageOps.autocontrast(im, weight_alpha=True, preserve_tone=True)
+
+    # Tone preservation uses one shared luminance table for all channels
+    reds = [preserved.getpixel((x, 0))[0] for x in range(3)]
+    greens = [preserved.getpixel((x, 0))[1] for x in range(3)]
+    blues = [preserved.getpixel((x, 0))[2] for x in range(3)]
+    assert reds != greens or greens != blues  # colors keep their hue
+    per_pixel = [per_channel.getpixel((x, 0))[:3] for x in range(3)]
+    preserved_pixel = [preserved.getpixel((x, 0))[:3] for x in range(3)]
+    assert per_pixel != preserved_pixel
+    # Alpha is still untouched
+    assert list(preserved.getchannel("A").get_flattened_data()) == [
+        0,
+        128,
+        255,
+    ]
+
+
+def test_autocontrast_weight_alpha_all_transparent() -> None:
+    im = Image.new("RGBA", (3, 1), (50, 60, 70, 0))
+
+    result = ImageOps.autocontrast(im, weight_alpha=True)
+
+    # No visible pixels: the lookup table is an identity mapping
+    assert_image_equal(result, im)
+
+
+def test_autocontrast_weight_alpha_no_alpha_parity() -> None:
+    # Images without alpha use unit weights, matching the regular result
+    for mode, color in (("L", None), ("RGB", None)):
+        im = hopper(mode)
+        regular = ImageOps.autocontrast(im)
+        weighted = ImageOps.autocontrast(im, weight_alpha=True)
+        assert_image_equal(regular, weighted)
+
+
+def test_autocontrast_weight_alpha_does_not_mutate_input() -> None:
+    im = Image.new("RGBA", (3, 1))
+    im.putpixel((0, 0), (0, 0, 0, 0))
+    im.putpixel((1, 0), (50, 60, 70, 128))
+    im.putpixel((2, 0), (200, 210, 220, 255))
+    before = list(im.get_flattened_data())
+
+    ImageOps.autocontrast(im, weight_alpha=True)
+
+    assert list(im.get_flattened_data()) == before
+
+
+def test_autocontrast_weight_alpha_disabled_unchanged() -> None:
+    # The new feature defaults off and the old code path is untouched
+    rgba = Image.new("RGBA", (1, 1))
+    with pytest.raises(OSError):
+        ImageOps.autocontrast(rgba)
+    la = Image.new("LA", (1, 1))
+    with pytest.raises(OSError):
+        ImageOps.autocontrast(la)
+
+
 @pytest.mark.parametrize(
     "operation",
     (

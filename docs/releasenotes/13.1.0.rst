@@ -64,6 +64,17 @@ Two new image processing operations are available in ImageOps.
 * :py:meth:`~PIL.ImageOps.neon`: apply a neon glow effect, with arguments for color and
   alpha
 
+ImageOps.autocontrast alpha weighting
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:py:meth:`~PIL.ImageOps.autocontrast` now accepts a ``weight_alpha`` keyword argument.
+When enabled, the histogram statistics are weighted by each pixel's alpha value, so
+transparent padding does not influence the contrast stretch while semi-transparent pixels
+contribute proportionally. The resulting color mapping is applied to the whole image and
+the alpha channel and palette transparency are left unchanged. Grayscale (``L``,
+``LA``), true color (``RGB``, ``RGBA``) and palette (``P``, ``PA``) images are
+supported, including the existing ``mask``, ``cutoff`` and ``preserve_tone`` options.
+
 Other changes
 =============
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 __lazy_modules__ = {"re"}
 
 import re
+import warnings
 from typing import Protocol, cast, overload
 
 from . import ExifTags, Image, ImageChops, ImageFilter, ImagePalette
@@ -28,6 +29,7 @@ from . import ExifTags, Image, ImageChops, ImageFilter, ImagePalette
 TYPE_CHECKING = False
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from types import ModuleType
     from typing import Literal
 
 #
@@ -56,6 +58,68 @@ def _color(
 
         color = ImageColor.getcolor(color, mode)
     return color
+
+
+def _weighted_histogram(image: Image.Image, weights: Image.Image | None) -> list[int]:
+    """
+    Histogram of an 8-bit image where each pixel contributes its weight
+    (an "L" value in 0..255) instead of a plain count of one. When no
+    weights are given, the regular unweighted histogram is returned.
+    """
+    if weights is None:
+        return image.histogram()
+    numpy: ModuleType | None
+    try:
+        import numpy
+    except ImportError:
+        numpy = None
+    if numpy is not None:
+        values = numpy.asarray(image)
+        weighted = numpy.asarray(weights, dtype=numpy.uint32)
+        # bincount over the flattened 8-bit values, weighted by visibility
+        histogram = numpy.bincount(
+            values.reshape(-1), weights=weighted.reshape(-1), minlength=256
+        )
+        return [int(value) for value in histogram]
+    histogram = [0] * 256
+    for value, weight in zip(image.tobytes(), weights.tobytes(), strict=True):
+        histogram[value] += weight
+    return histogram
+
+
+def _alpha_weights(image: Image.Image, mask: Image.Image | None) -> Image.Image | None:
+    """
+    Build the per-pixel visibility weights of an image as an "L" image.
+    Pixel transparency (alpha) is used as the weight, optionally restricted
+    by a region mask. Returns None when the image has no alpha channel and
+    no region mask is given.
+    """
+    if image.mode in ("LA", "PA", "RGBA"):
+        weights = image.getchannel("A")
+    elif image.mode == "P":
+        # A palette image may carry visibility in an RGBA palette or through
+        # its transparency info; convert() resolves all of those to alpha
+        if image.info.get("transparency") is None and (
+            image.palette is None or image.palette.mode != "RGBA"
+        ):
+            if mask is None:
+                return None
+            weights = Image.new("L", image.size, 255)
+        else:
+            with warnings.catch_warnings():
+                # Byte-wise palette transparency warns when converting; the
+                # alpha channel is exactly what we are after here
+                warnings.simplefilter("ignore", UserWarning)
+                weights = image.convert("RGBA").getchannel("A")
+    elif mask is None:
+        return None
+    else:
+        # No alpha channel, but a region mask restricts the statistics
+        weights = Image.new("L", image.size, 255)
+    if mask is not None:
+        # Pixels outside the region mask take no part in the statistics
+        weights = ImageChops.multiply(weights, mask.point([0, *([255] * 255)]))
+    return weights
 
 
 def _lut(image: Image.Image, lut: list[int], palette: bool = False) -> Image.Image:
@@ -93,53 +157,14 @@ def _lut(image: Image.Image, lut: list[int], palette: bool = False) -> Image.Ima
 # actions
 
 
-def autocontrast(
-    image: Image.Image,
-    cutoff: float | tuple[float, float] = 0,
-    ignore: int | Sequence[int] | None = None,
-    mask: Image.Image | None = None,
-    preserve_tone: bool = False,
-) -> Image.Image:
-    """
-    Maximize (normalize) image contrast. This function calculates a
-    histogram of the input image (or mask region), removes ``cutoff`` percent of the
-    lightest and darkest pixels from the histogram, and remaps the image
-    so that the darkest pixel becomes black (0), and the lightest
-    becomes white (255).
-
-    :param image: The image to process.
-    :param cutoff: The percent to cut off from the histogram on the low and
-                   high ends. Either a tuple of (low, high), or a single
-                   number for both.
-    :param ignore: The background pixel value (use None for no background).
-    :param mask: Histogram used in contrast operation is computed using pixels
-                 within the mask. If no mask is given the entire image is used
-                 for histogram computation.
-    :param preserve_tone: Preserve image tone in Photoshop-like style autocontrast.
-
-                          .. versionadded:: 8.2.0
-
-    :return: An image.
-    """
-    if isinstance(cutoff, tuple) and len(cutoff) != 2:
-        msg = (  # type: ignore[unreachable]
-            "cutoff must be either a tuple of (low, high), or a single number for both"
-        )
-        raise ValueError(msg)
-
-    if ignore is not None:
-        if isinstance(ignore, int):
-            ignore = (ignore,)
-        if not all(0 <= ix <= 255 for ix in ignore):
-            msg = "ignore must be between or equal to 0 and 255"
-            raise ValueError(msg)
-
-    if preserve_tone:
-        histogram = image.convert("L").histogram(mask)
-    else:
-        histogram = image.histogram(mask)
-
-    lut = []
+def _autocontrast_lut(
+    histogram: list[int],
+    cutoff: float | tuple[float, float],
+    ignore: Sequence[int] | None,
+) -> list[int]:
+    """Build the per-channel lookup tables from a (possibly weighted)
+    concatenated histogram."""
+    lut: list[int] = []
     for layer in range(0, len(histogram), 256):
         h = histogram[layer : layer + 256]
         if ignore is not None:
@@ -192,7 +217,151 @@ def autocontrast(
                 elif ix > 255:
                     ix = 255
                 lut.append(ix)
+    return lut
+
+
+def _apply_autocontrast_lut(image: Image.Image, lut: list[int]) -> Image.Image:
+    """Apply color lookup tables, leaving alpha channels untouched."""
+    if image.mode == "RGBA":
+        return image.point(lut + list(range(256)))
+    if image.mode == "LA":
+        return image.point(lut + list(range(256)))
+    if image.mode == "PA":
+        # _lut only handles mode P; remap the palette colors in place while
+        # keeping the per-pixel alpha band untouched
+        im = image.copy()
+        assert im.palette is not None
+        palette_mode = im.palette.mode
+        channels = len(palette_mode)
+        colors = im.getpalette(None)
+        assert colors is not None
+        im.putpalette(
+            [
+                value if palette_mode[i % channels] == "A" else lut[value]
+                for i, value in enumerate(colors)
+            ],
+            palette_mode,
+        )
+        return im
+    if image.mode == "P":
+        return _lut(image, lut, palette=True)
     return _lut(image, lut)
+
+
+def autocontrast(
+    image: Image.Image,
+    cutoff: float | tuple[float, float] = 0,
+    ignore: int | Sequence[int] | None = None,
+    mask: Image.Image | None = None,
+    preserve_tone: bool = False,
+    *,
+    weight_alpha: bool = False,
+) -> Image.Image:
+    """
+    Maximize (normalize) image contrast. This function calculates a
+    histogram of the input image (or mask region), removes ``cutoff`` percent of the
+    lightest and darkest pixels from the histogram, and remaps the image
+    so that the darkest pixel becomes black (0), and the lightest
+    becomes white (255).
+
+    :param image: The image to process.
+    :param cutoff: The percent to cut off from the histogram on the low and
+                   high ends. Either a tuple of (low, high), or a single
+                   number for both.
+    :param ignore: The background pixel value (use None for no background).
+    :param mask: Histogram used in contrast operation is computed using pixels
+                 within the mask. If no mask is given the entire image is used
+                 for histogram computation.
+    :param preserve_tone: Preserve image tone in Photoshop-like style autocontrast.
+
+                          .. versionadded:: 8.2.0
+
+    :param weight_alpha: Weight the histogram statistics by pixel visibility.
+                         Each pixel's contribution is multiplied by its alpha
+                         value, so fully transparent padding does not affect
+                         the contrast stretch while semi-transparent pixels
+                         contribute proportionally. The resulting color mapping
+                         is applied to the whole image, and the alpha channel
+                         and palette transparency are left unchanged. Supports
+                         grayscale ("L", "LA"), true color ("RGB", "RGBA") and
+                         palette ("P", "PA") images. Images without an alpha
+                         channel behave as if every pixel were fully opaque.
+
+                         .. versionadded:: 13.1.0
+
+    :return: An image.
+    """
+    if isinstance(cutoff, tuple) and len(cutoff) != 2:
+        msg = (  # type: ignore[unreachable]
+            "cutoff must be either a tuple of (low, high), or a single number for both"
+        )
+        raise ValueError(msg)
+
+    if ignore is not None:
+        if isinstance(ignore, int):
+            ignore = (ignore,)
+        if not all(0 <= ix <= 255 for ix in ignore):
+            msg = "ignore must be between or equal to 0 and 255"
+            raise ValueError(msg)
+
+    if not weight_alpha:
+        if preserve_tone:
+            histogram = image.convert("L").histogram(mask)
+        else:
+            histogram = image.histogram(mask)
+        return _lut(image, _autocontrast_lut(histogram, cutoff, ignore))
+
+    # Visibility-weighted statistics: a pixel's histogram contribution is
+    # multiplied by its alpha (and by the optional region mask). The mapping
+    # is still applied to the whole image, including transparent areas.
+    if mask is not None:
+        if mask.size != image.size:
+            msg = "images do not match"
+            raise ValueError(msg)
+        if mask.mode not in ("1", "L"):
+            msg = "bad transparency mask"
+            raise ValueError(msg)
+    weights = _alpha_weights(image, mask)
+    is_palette = image.mode in ("P", "PA")
+    if preserve_tone:
+        # A single shared table derived from luminance keeps the color tone
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            gray = image.convert("L")
+        histogram = _weighted_histogram(gray, weights)
+    elif is_palette:
+        # The table is applied to the palette colors, so the statistics are
+        # computed on those colors, weighted by the visibility of the pixels
+        # referencing each palette entry
+        with warnings.catch_warnings():
+            # Byte-wise palette transparency warns on conversion; the alpha
+            # is already accounted for by the weights
+            warnings.simplefilter("ignore", UserWarning)
+            palette_rgb = image.convert("RGB")
+        histogram = []
+        for band in palette_rgb.split():
+            histogram.extend(_weighted_histogram(band, weights))
+    else:
+        histogram = []
+        for band, band_name in zip(image.split(), image.getbands(), strict=True):
+            if band_name == "A":
+                # Alpha values take no part in the light/dark statistics
+                continue
+            histogram.extend(_weighted_histogram(band, weights))
+
+    lut = _autocontrast_lut(histogram, cutoff, ignore)
+    if preserve_tone:
+        if image.mode in ("L", "LA"):
+            # A single grayscale table
+            pass
+        else:
+            # The same luminance table must drive every color channel; any
+            # alpha channel is handled separately by _apply_autocontrast_lut
+            color_channels = len(
+                [band_name for band_name in image.getbands() if band_name != "A"]
+            )
+            lut = lut * color_channels
+    return _apply_autocontrast_lut(image, lut)
 
 
 def colorize(
